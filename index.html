@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Hold Still — 움직이지 마세요</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #16120e; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+  canvas { height: 84vh; max-width: 94vw; object-fit: contain; image-rendering: auto; box-shadow: 0 0 60px #000; }
+  a { color: #d9c7a3; font: 15px Georgia, serif; text-decoration: none; border: 1px solid #6b5b45; padding: 8px 18px; }
+  a[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<a id="save" hidden download="hold-still.png">사진 저장</a>
+
+<script>
+// ───────── 설정값 ─────────
+const W = 480, H = 360;          // 사진 해상도
+const MW = 64, MH = 48;          // 움직임 감지용 축소 해상도 (작을수록 노이즈에 강함)
+const POSES = ["정면을 보세요", "왼쪽을 보세요", "오른쪽을 보세요", "턱을 살짝 드세요"];
+const POSE_SEC = 3;              // 셔터 닫힘: 자세 바꾸는 시간
+const EXPOSE_SEC = 5;            // 셔터 열림: 멈춰야 하는 시간
+const PASS = 70;                 // 성공 기준 선명도(%)
+const PIXEL_DIFF = 18;           // 밝기가 이만큼 넘게 바뀐 픽셀을 "움직인 픽셀"로 본다
+const NOISE = 0.01, RANGE = 0.08; // 움직인 픽셀 비율 → 정지도 변환 기준 (노이즈 / 움직임 폭)
+const WAVE = 0.12;               // 결과 화면에서 이 비율 이상 움직이면 "손 흔들기"
+const LINES = ["숨 참으세요", "웃지 마세요", "눈도 깜빡이지 마세요", "조금만 더…", "움직이시면 안 됩니다"];
+const PAPER = [238, 226, 204];   // 인화지 색
+
+// ───────── 캔버스 준비 ─────────
+const view = document.getElementById("view"), ctx = view.getContext("2d");
+view.width = W; view.height = H;
+const video = Object.assign(document.createElement("video"), { playsInline: true, muted: true });
+const grab = makeCanvas(W, H), small = makeCanvas(MW, MH), photo = makeCanvas(W, H);
+const out = ctx.createImageData(W, H);
+const saveLink = document.getElementById("save");
+
+function makeCanvas(w, h) {
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  c.g = c.getContext("2d", { willReadFrequently: true });
+  return c;
+}
+
+// 장노출의 핵심: 셔터가 열린 동안의 프레임 밝기를 픽셀마다 계속 더한다
+const accum = new Float32Array(W * H);
+let frames = 0;
+
+// 가장자리를 어둡게 (옛날 렌즈 느낌)
+const vignette = new Float32Array(W * H);
+for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+  const dx = (x - W / 2) / (W / 2), dy = (y - H / 2) / (H / 2);
+  vignette[y * W + x] = 1 - 0.55 * Math.min(1, (dx * dx + dy * dy) * 0.6);
+}
+
+// ───────── 움직임 감지: 0.1초 전 프레임과 비교해 "움직인 픽셀"의 비율을 잰다 ─────────
+// (직전 회차와 비교하면 웹캠이 모니터보다 느려서 같은 사진끼리 비교하게 된다)
+let prev = null, prevT = 0, motion = 0;
+function measureMotion(now) {
+  small.g.drawImage(grab, 0, 0, MW, MH);
+  const d = small.g.getImageData(0, 0, MW, MH).data;
+  const cur = new Float32Array(MW * MH);
+  let moved = 0;
+  for (let i = 0; i < cur.length; i++) {
+    cur[i] = (d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]) / 3;
+    if (prev && Math.abs(cur[i] - prev[i]) > PIXEL_DIFF) moved++;
+  }
+  if (!prev || now - prevT > 100) { prev = cur; prevT = now; }
+  motion = motion * 0.6 + (moved / cur.length) * 0.4; // 부드럽게
+}
+const stillness = () => Math.max(0, Math.min(1, 1 - (motion - NOISE) / RANGE));
+
+// ───────── 누적된 빛 → 세피아 사진으로 그리기 ─────────
+// reveal: 0이면 빈 인화지, 1이면 완전히 현상된 사진
+function develop(target, reveal) {
+  const o = target.data;
+  for (let i = 0; i < W * H; i++) {
+    const v = frames ? accum[i] / frames : 255;
+    const c = Math.min(255, Math.max(0, (v - 128) * 1.25 + 128)) * vignette[i];
+    const tone = [c * 1.07 + 18, c * 0.95 + 8, c * 0.78];
+    for (let k = 0; k < 3; k++) o[i * 4 + k] = PAPER[k] * (1 - reveal) + Math.min(255, tone[k]) * reveal;
+    o[i * 4 + 3] = 255;
+  }
+  return target;
+}
+
+// ───────── 게임 상태 ─────────
+let state = "intro", t0 = 0, pose = 0, hold = 0, stillSum = 0, stillN = 0, score = 0, line = "";
+const fly = { x: 100, y: 80, vx: 1, vy: 1 };
+function go(next, now) { state = next; t0 = now; hold = 0; }
+
+function resetShoot() {
+  accum.fill(0); frames = 0; pose = 0; stillSum = 0; stillN = 0;
+  saveLink.hidden = true;
+}
+
+let last = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (video.readyState < 2) return;
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  const el = (now - t0) / 1000;
+
+  // 웹캠 프레임을 좌우반전해서 가져온다 (거울처럼)
+  grab.g.setTransform(-1, 0, 0, 1, W, 0);
+  grab.g.drawImage(video, 0, 0, W, H);
+  measureMotion(now);
+
+  if (state === "intro") {
+    ctx.globalAlpha = 0.35; ctx.drawImage(grab, 0, 0); ctx.globalAlpha = 1;
+    text("HOLD STILL", W / 2, 120, 44);
+    text("움직이지 마세요", W / 2, 158, 18);
+    text("가만히 있으면 촬영이 시작됩니다", W / 2, 250, 15);
+    hold = stillness() > 0.8 ? hold + dt : 0;
+    bar(W / 2 - 90, 270, 180, hold / 2.5);
+    gauge();
+    if (hold >= 2.5) { resetShoot(); go("pose", now); }
+  }
+
+  else if (state === "pose") { // 셔터 닫힘: 자유롭게 자세를 바꾼다
+    ctx.globalAlpha = 0.45; ctx.drawImage(grab, 0, 0); ctx.globalAlpha = 1;
+    text(`포즈 ${pose + 1} / ${POSES.length}`, W / 2, 110, 15);
+    text(POSES[pose], W / 2, 160, 30);
+    text(Math.ceil(POSE_SEC - el), W / 2, 230, 48);
+    text("셔터가 열리면 멈추세요", W / 2, 280, 14);
+    gauge();
+    if (el >= POSE_SEC) { line = pick(LINES); go("expose", now); }
+  }
+
+  else if (state === "expose") { // 셔터 열림: 프레임을 쌓는다
+    const px = grab.g.getImageData(0, 0, W, H).data;
+    for (let i = 0; i < W * H; i++) accum[i] += (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2]) / 3;
+    frames++;
+    stillSum += stillness(); stillN++;
+
+    const reveal = 0.25 + 0.75 * (pose * EXPOSE_SEC + el) / (POSES.length * EXPOSE_SEC);
+    ctx.putImageData(develop(out, reveal), 0, 0);
+    ctx.drawImage(grab, W - 104, 8, 96, 72);           // 실시간 웹캠 (작게)
+    ctx.strokeStyle = "#e9dcc3"; ctx.strokeRect(W - 104, 8, 96, 72);
+    if (el % 1.7 < dt) line = pick(LINES);
+    text(`“${line}”`, W / 2, 40, 18, "#2a1f14");
+    drawFly();
+    bar(20, H - 22, W - 40, 1 - el / EXPOSE_SEC, "#8b1e1e");
+    gauge();
+    if (el >= EXPOSE_SEC) {
+      pose++;
+      if (pose < POSES.length) go("pose", now);
+      else finish(now);
+    }
+  }
+
+  else if (state === "result") {
+    ctx.drawImage(photo, 0, 0);
+    const ok = score >= PASS;
+    ctx.fillStyle = "rgba(20,15,10,0.65)"; ctx.fillRect(0, H - 74, W, 74);
+    text(`선명도 ${score}%  —  ${ok ? "훌륭한 초상입니다" : "유령이 찍혔군요"}`, W / 2, H - 44, 18);
+    text("다시 찍으려면 손을 크게 흔드세요", W / 2, H - 18, 13);
+    hold = el > 3 && motion > WAVE ? hold + dt : Math.max(0, hold - dt);
+    bar(W / 2 - 90, H - 8, 180, hold / 0.6);
+    gauge();
+    if (hold > 0.6) go("intro", now);
+  }
+}
+
+function finish(now) {
+  score = Math.round(stillSum / stillN * 100);
+  photo.g.putImageData(develop(photo.g.createImageData(W, H), 1), 0, 0);
+  photo.g.fillStyle = "#3a2c1d"; photo.g.font = "italic 12px Georgia, serif"; photo.g.textAlign = "right";
+  photo.g.fillText(`Hold Still · 1839 · ${score}%`, W - 14, 22);
+  saveLink.href = photo.toDataURL("image/png");
+  saveLink.hidden = false;
+  go("result", now);
+}
+
+// ───────── 그리기 도우미 ─────────
+function text(s, x, y, size, color = "#f1e4c8") {
+  ctx.fillStyle = color; ctx.textAlign = "center";
+  ctx.font = `${size}px Georgia, "Nanum Myeongjo", serif`;
+  ctx.fillText(s, x, y);
+}
+function bar(x, y, w, p, color = "#e9dcc3") {
+  ctx.strokeStyle = color; ctx.strokeRect(x, y, w, 6);
+  ctx.fillStyle = color; ctx.fillRect(x, y, w * Math.max(0, Math.min(1, p)), 6);
+}
+function gauge() { // 입력 감지 표시: 지금 얼마나 움직이고 있는지
+  const m = 1 - stillness();
+  ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(8, 8, 110, 26);
+  ctx.fillStyle = m < 0.2 ? "#7fae6b" : m < 0.6 ? "#d6a447" : "#c2433a";
+  ctx.fillRect(14, 22, 98 * m, 6);
+  ctx.fillStyle = "#e9dcc3"; ctx.font = "10px Georgia, serif"; ctx.textAlign = "left";
+  ctx.fillText(m < 0.2 ? "정지" : "움직임", 14, 18);
+}
+function drawFly() { // 방해꾼 파리
+  fly.vx += (Math.random() - 0.5) * 0.8; fly.vy += (Math.random() - 0.5) * 0.8;
+  fly.vx *= 0.95; fly.vy *= 0.95;
+  fly.x = (fly.x + fly.vx * 3 + W) % W; fly.y = Math.max(50, Math.min(H - 40, fly.y + fly.vy * 3));
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.beginPath(); ctx.ellipse(fly.x - 3, fly.y - 3, 4, 2, -0.6, 0, 7); ctx.ellipse(fly.x + 3, fly.y - 3, 4, 2, 0.6, 0, 7); ctx.fill();
+  ctx.fillStyle = "#111"; ctx.beginPath(); ctx.ellipse(fly.x, fly.y, 2.5, 3.5, 0, 0, 7); ctx.fill();
+}
+const pick = a => a[Math.floor(Math.random() * a.length)];
+
+// ───────── 시작 ─────────
+navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false })
+  .then(stream => { video.srcObject = stream; video.play(); requestAnimationFrame(loop); })
+  .catch(() => { ctx.fillStyle = "#16120e"; ctx.fillRect(0, 0, W, H); text("카메라 권한이 필요합니다", W / 2, H / 2, 18); });
+</script>
+</body>
+</html>
