@@ -22,10 +22,11 @@ const MW = 64, MH = 48;          // 움직임 감지용 축소 해상도 (작을
 const POSES = ["정면을 보세요", "왼쪽을 보세요", "오른쪽을 보세요", "턱을 살짝 드세요"];
 const POSE_SEC = 3;              // 셔터 닫힘: 자세 바꾸는 시간
 const EXPOSE_SEC = 5;            // 셔터 열림: 멈춰야 하는 시간
-const PASS = 70;                 // 성공 기준 선명도(%)
+const PASS = 80;                // 성공 기준 선명도(%)
 const PIXEL_DIFF = 18;           // 밝기가 이만큼 넘게 바뀐 픽셀을 "움직인 픽셀"로 본다
 const NOISE = 0.01, RANGE = 0.08; // 움직인 픽셀 비율 → 정지도 변환 기준 (노이즈 / 움직임 폭)
-const WAVE = 0.12;               // 결과 화면에서 이 비율 이상 움직이면 "손 흔들기"
+const BLUR_RANGE = 0.04;         // 번짐 판정 폭 (작을수록 엄격)
+const WAVE = 0.035;             // 결과 화면에서 이 비율 이상 움직이면 "손 흔들기"
 const LINES = ["숨 참으세요", "웃지 마세요", "눈도 깜빡이지 마세요", "조금만 더…", "움직이시면 안 됩니다"];
 const PAPER = [238, 226, 204];   // 인화지 색
 
@@ -68,8 +69,22 @@ function measureMotion(now) {
   }
   if (!prev || now - prevT > 100) { prev = cur; prevT = now; }
   motion = motion * 0.6 + (moved / cur.length) * 0.4; // 부드럽게
+
+  // 번짐 측정: 셔터가 열린 뒤 쌓인 평균 모습(ref)과 지금 모습이 얼마나 다른가
+  // 천천히 흔들려도 평균에서 멀어지면 잡힌다 → 사진이 번진 정도와 일치
+  if (state !== "expose") return;
+  let off = 0;
+  for (let i = 0; i < cur.length; i++) {
+    if (refN && Math.abs(cur[i] - ref[i]) > PIXEL_DIFF) off++;
+    ref[i] = (ref[i] * refN + cur[i]) / (refN + 1);
+  }
+  refN++;
+  blur = off / cur.length;
 }
-const stillness = () => Math.max(0, Math.min(1, 1 - (motion - NOISE) / RANGE));
+const ref = new Float32Array(MW * MH);
+let refN = 0, blur = 0;
+const toStill = (m, range) => Math.max(0, Math.min(1, 1 - (m - NOISE) / range));
+const stillness = () => state === "expose" ? toStill(blur, BLUR_RANGE) : toStill(motion, RANGE);
 
 // ───────── 누적된 빛 → 세피아 사진으로 그리기 ─────────
 // reveal: 0이면 빈 인화지, 1이면 완전히 현상된 사진
@@ -88,7 +103,7 @@ function develop(target, reveal) {
 // ───────── 게임 상태 ─────────
 let state = "intro", t0 = 0, pose = 0, hold = 0, stillSum = 0, stillN = 0, score = 0, line = "";
 const fly = { x: 100, y: 80, vx: 1, vy: 1 };
-function go(next, now) { state = next; t0 = now; hold = 0; }
+function go(next, now) { state = next; t0 = now; hold = 0; refN = 0; blur = 0; }
 
 function resetShoot() {
   accum.fill(0); frames = 0; pose = 0; stillSum = 0; stillN = 0;
@@ -200,6 +215,11 @@ function drawFly() { // 방해꾼 파리
   ctx.fillStyle = "#111"; ctx.beginPath(); ctx.ellipse(fly.x, fly.y, 2.5, 3.5, 0, 0, 7); ctx.fill();
 }
 const pick = a => a[Math.floor(Math.random() * a.length)];
+
+// 보조 조작: 결과 화면에서 클릭이나 스페이스바로도 다시 찍기
+const restart = () => { if (state === "result") go("intro", performance.now()); };
+view.addEventListener("click", restart);
+addEventListener("keydown", e => { if (e.code === "Space") restart(); });
 
 // ───────── 시작 ─────────
 navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false })
